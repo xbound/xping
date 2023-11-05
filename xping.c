@@ -1,8 +1,16 @@
 /****************************************************************
  *	GNU General Public License Version 3 or later (GPL3+)	*
- *	https://www.gnu.org/licenses/gpl-3.0.html		*
+ *		https://www.gnu.org/licenses/gpl-3.0.txt	*
  ****************************************************************/
 #define _GNU_SOURCE
+char license[]={
+#ifdef DOC_BIN
+#include "license_bin"
+	,'\n',0x00
+#else 
+	"https://www.gnu.org/licenses/gpl-3.0.txt\n"
+#endif
+};
 #include <stdio.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
@@ -24,6 +32,8 @@
 #include <pthread.h>
 #include <fcntl.h>
 #include <sys/epoll.h>
+//#define RELEASE
+//#define USE_EPOLL_PWAIT2 //suggested if you kernel version>=5.11
 #define ERR_LSEEK ((off_t)-1)
 #define waitf(uaddr,val) syscall(SYS_futex,uaddr,FUTEX_WAIT,val,NULL,NULL,0)
 //#define waitf(uaddr,val) (-1)
@@ -34,7 +44,7 @@
 #define TSTACK_SIZE (8192)
 #define INPUT_SIZE 1024
 struct argandret{
-	long id;
+	long id,tid;
 	unsigned long sent,sent_ok,sent_size,aborted,nerror;
 	long end;
 	uint32_t mutex;
@@ -47,9 +57,11 @@ enum __proto {P_NONE,P_ETHER,P_IP,P_IP6,P_ICMP,P_ICMP6,P_UDP} base_proto=P_NONE;
 enum __proto upper_proto=P_ICMP;
 struct timespec ts;
 //int sock_domain,sock_protocol;
-uint16_t icmp_seq0=0,icmp_type=ICMP_ECHO,icmp_echoid=0,sin_port=0;
+uint16_t icmp_seq0=0,icmp_type=ICMP_ECHO,icmp_echoid=0;
+uint16_t sin_port=0;
+struct in_addr ip_addr;
 char sleep_between_sents=0,running,count_written=0,update_ok=1;
-char *target=NULL,*bind_device=NULL,*data_from_file=NULL;
+char *target=NULL,*bind_device=NULL,*data_from_file=NULL,*tstack;
 size_t packlen,data_size=0,sent_sum=0,sent_sum_ok=0,count=0,sent_sum_size=0,aborted_sum=0,nerror_sum=0;
 void (*phdr[MAX_NPROCESS])(void *s,size_t offset,struct argandret *aar);
 size_t (*fhdr[MAX_NPROCESS])(void *s,size_t offset,struct argandret *aar);
@@ -61,19 +73,28 @@ char input2[INPUT_SIZE];//read_stdin
 char lastcmd[INPUT_SIZE];
 int hidden_errors[MAX_HIDDEN_ERRORS];
 long nhidden_errors=0;
-long nthreads=1,cthreads,rthreads=0,intcount=0;
-char *tstack;
+long nthreads=1,cthreads,rthreads=0;
 struct argandret *targ;
-int lastsig=0;
+int pid,ctout=-1;
 volatile uint32_t smutex=0;
 unsigned int do_alarm=0;
 pthread_mutex_t gmutex;
+struct timespec cts;
+//struct timeval ctv;
+struct timespec *pcts=NULL;
+//struct timeval *pctv=NULL;
+
 //#define epoll_create(x) (-1)
 //#define epoll_ctl(x,y,z,t) (-1)
 //#define clone(x,y,z,t) (-1)
 //#define malloc(x) NULL
-int dat2nanol(const char *restrict a,long *intp,long *nanop){
-	long i,n,r0;
+const char *bfname(const char *path){
+	if(path[0]=='/'&&path[1]=='\0')return path;
+	path=strrchr(path,'/');
+	return path+1;
+}
+int dat2spec(const char *restrict a,struct timespec *restrict spec){
+	unsigned long i,n,r0;
 	i=0;n=0;
 	while(*a){
 		if(*a<='9'&&*a>='0'){
@@ -84,7 +105,8 @@ int dat2nanol(const char *restrict a,long *intp,long *nanop){
 		}else return 0;
 	}
 	if(!*a){
-		*intp=i;
+	spec->tv_sec=i;
+	spec->tv_nsec=0;
 		return 1;
 	}
 	r0=1000000000l/10l;
@@ -94,8 +116,8 @@ int dat2nanol(const char *restrict a,long *intp,long *nanop){
 			r0/=10;
 		}else return 0;
 	}
-	*intp=i;
-	*nanop=n;
+	spec->tv_sec=i;
+	spec->tv_nsec=n;
 return 2;
 }
 char *b2hu(size_t byte,char *out){
@@ -129,6 +151,45 @@ uint16_t cksum(const void *s,size_t n){
 	sum=(sum>>16)+(sum&0xffff);
 	return ~sum;
 }
+int sockerr(int fd){
+	socklen_t optlen;
+	optlen=sizeof(fd);
+	getsockopt(fd,SOL_SOCKET,SO_ERROR,&fd,&optlen);
+	return fd;
+}
+int checksockfd(int fd,int epfd,int *errn){
+	int r0;
+	struct epoll_event ev;
+	fd_set efds,wfds;
+	if(epfd>=0){
+#ifdef USE_EPOLL_PWAIT2
+		if((r0=epoll_pwait2(epfd,&ev,1,pcts,NULL))<0){
+#else
+		if((r0=epoll_pwait(epfd,&ev,1,ctout,NULL))<0){
+#endif
+			*errn=errno;
+			return -1;
+		}
+		else if(r0>0&&ev.events&EPOLLERR){
+			*errn=sockerr(fd);
+			return 1;
+		}else return 0;
+	}
+	//checking with epoll completed. now treat the case with select
+	FD_ZERO(&wfds);
+	FD_ZERO(&efds);
+	FD_SET(fd,&wfds);
+	FD_SET(fd,&efds);
+	if((r0=pselect(fd+1,NULL,&wfds,&efds,pcts,NULL))<0){
+		*errn=errno;
+		return -1;
+	}else if(r0>0&&FD_ISSET(fd,&efds)){
+//		puts("efds");
+		*errn=sockerr(fd);
+		return 1;
+	}else return 0;
+}
+
 void errexit(const char *msg){
 	write(STDERR_FILENO,msg,strlen(msg));
 	exit(1);
@@ -224,12 +285,7 @@ int newerr(int errn){
 pthread_mutex_unlock(&gmutex);
 return errn;
 }
-int sockerr(int fd){
-	socklen_t optlen;
-	optlen=sizeof(fd);
-	getsockopt(fd,SOL_SOCKET,SO_ERROR,&fd,&optlen);
-	return fd;
-}
+
 int writing(void *arg){
 union {
 	struct sockaddr a;
@@ -243,13 +299,12 @@ char inputp[INPUT_SIZE];
 long id;
 size_t sent=0,sent_ok=0,sent_size=0,aborted=0,nerror=0;
 int fd,lasterr=0,r0,r1,epfd;
-fd_set wfds;
 memset(&uaddr,0,sizeof(uaddr));
 id=((struct argandret *)arg)->id;
 switch(base_proto){
 	case P_ICMP:
 		uaddr.a.sa_family=AF_INET;
-		uaddr.in.sin_addr.s_addr=inet_addr(target);
+		memcpy(&uaddr.in.sin_addr,&ip_addr,sizeof(ip_addr));
 		if(sock_type==TYPE_AUTO){
 			fd=socket(AF_INET,SOCK_RAW,IPPROTO_ICMP);
 			if(fd<0){
@@ -380,31 +435,22 @@ if(epoll_ctl(epfd,EPOLL_CTL_ADD,fd,&epevent)<0){
 waitf(&smutex,0);
 while(running){
 	if(!update_ok||r>=0)proc_all(sbuf,arg);
-	if(epfd>=0){
-		if(epoll_wait(epfd,&epevent,1,-1)<0){
-			r0=errno;
-			++nerror;
-		}
-		else if(epevent.events&EPOLLERR){
-			r0=sockerr(fd);
-			++aborted;
-		}else goto epoll_noerr;
+	if(check_mode!=CHECK_NO){
+		if(!(r1=checksockfd(fd,epfd,&r0)))goto noerr;
+		if(r1==1)++aborted;
+		else if(r0!=EINTR||running)++nerror;
+		else goto ignore_err;
 		if(lasterr!=r0&&(r0=newerr(r0))){
-			r1=sprintf(inputp,"\n%ld: checked (and aborted) %lu th packet:%s (same errors following will be hidden)\n",id,sent,strerror(r0));
+			r1=sprintf(inputp,"\n%ld: %s before writing %lu th packet:%s (same errors following will be hidden)\n",id,r1>0?"error avoided":"cannot check",sent,strerror(r0));
 			write(STDERR_FILENO,inputp,r1);
 			lasterr=errno;
 		}
+ignore_err:
 			r=-1;
 			continue;
 	}
-	else if(check_mode==CHECK_SELECT||check_mode==CHECK_AUTO){
-	FD_ZERO(&wfds);
-	FD_SET(fd,&wfds);
-	select(fd+1,NULL,&wfds,NULL,NULL);
-	}
-epoll_noerr:
+noerr:
 	r=write(fd,sbuf,packlen);
-	//fsync(fd);
 	++sent;
 	if(r<0){
 		r0=errno;
@@ -421,7 +467,7 @@ epoll_noerr:
 	//fprintf(stderr,"%hu\n",icmp_seqc);
 	}
 	if(sleep_between_sents){
-		clock_gettime(CLOCK_REALTIME,&ts_new);
+		clock_gettime(CLOCK_MONOTONIC,&ts_new);
 			ts_use.tv_sec=ts_new.tv_sec-ts_old.tv_sec;
 			if(ts_new.tv_nsec<ts_old.tv_nsec){
 				ts_use.tv_nsec=1000000000l+ts_new.tv_nsec-ts_old.tv_nsec;
@@ -430,7 +476,7 @@ epoll_noerr:
 			else ts_use.tv_nsec=ts_new.tv_nsec-ts_old.tv_nsec;
 		if(ts_use.tv_sec>ts.tv_sec||(ts_use.tv_sec==ts.tv_sec&&ts_use.tv_nsec>ts.tv_nsec))
 		{
-			clock_gettime(CLOCK_REALTIME,&ts_old);
+			clock_gettime(CLOCK_MONOTONIC,&ts_old);
 		}else {
 		ts_use.tv_sec=ts.tv_sec-ts_use.tv_sec;
 		if(ts.tv_nsec<ts_use.tv_nsec){
@@ -481,7 +527,7 @@ return 1;
 
 int prewriting(void *arg){
 	int r;
-	char buf[32];
+	//char buf[32];
 	r=writing(arg);
 	if(r==0)
 	((struct argandret *)arg)->end=1;
@@ -497,15 +543,24 @@ int prewriting(void *arg){
 	wakef(&((struct argandret *)arg)->mutex,1);
 	return r;
 }
+void end_all_sleeping(void){
+	long r1;
+	pthread_mutex_lock(&gmutex);
+	for(r1=0;r1<nthreads;++r1){
+		if(targ[r1].id!=-1&&targ[r1].end==0)
+			tgkill(pid,targ[r1].tid,SIGUSR1);
+	}
+	pthread_mutex_unlock(&gmutex);
+}
 uint32_t read_stdin_mutex;
 int read_stdin(void *arg){
 	ssize_t r;
 	long r1,r2,r3,r0;
-	char *p,*p2;
+	char *p;
 	char *saveptr;
 	fd_set fds;
 	*lastcmd=0;
-	while(running){
+	for(;;){
 		FD_ZERO(&fds);
 		FD_SET(STDIN_FILENO,&fds);
 		if(select(STDIN_FILENO+1,&fds,NULL,NULL,NULL)<0){
@@ -517,7 +572,9 @@ int read_stdin(void *arg){
 	//fprintf(stderr,"\n%d/%d:select\n",getpid(),gettid());
 		r=read(STDIN_FILENO,input,INPUT_SIZE);
 		if(r==0){
+end:
 			running=0;
+			end_all_sleeping();
 			break;
 		}
 		else if(r<0)break;
@@ -530,8 +587,7 @@ redo_cmd:
 		}else strcpy(lastcmd,input);
 		strtok_r(input," ",&saveptr);
 		if(strcmp(input,"end")==0||strcmp(input,"quit")==0||strcmp(input,"q")==0||strcmp(input,"exit")==0){
-			running=0;
-			break;
+			goto end;
 		}else if(strcmp(input,"err")==0||strcmp(input,"error")==0||strcmp(input,"e")==0){
 			pthread_mutex_lock(&gmutex);
 			nhidden_errors=0;
@@ -563,7 +619,7 @@ redo_cmd:
 			if(r1<1)goto inarg;
 			}
 			else r2=SIGKILL;
-			kill(getpid(),r2);
+			kill(pid,r2);
 			continue;
 		}else if(strcmp(input,"alarm")==0||strcmp(input,"alrm")==0){
 			p=strtok_r(NULL," ",&saveptr);
@@ -616,15 +672,16 @@ inarg:
 	//select(0,NULL,NULL,NULL,NULL);
 	return 0;
 }
+
 void psig(int sig){
-	lastsig=sig;
 	switch(sig){
 		case SIGINT:
 			running=0;
 			//fprintf(stderr,"\nSIGINT\n");
-			++intcount;
+			//++intcount;
 			//printf("%ld\n",intcount);
 			//if(intcount>1)signal(SIGINT,SIG_DFL);
+			end_all_sleeping();
 			break;
 		case SIGABRT:
 			//fprintf(stderr,"\nSIGABRT\n");
@@ -635,7 +692,7 @@ void psig(int sig){
 			running=0;
 			break;
 		case SIGUSR1:
-			running=0;
+			//running=0;
 			//fprintf(stderr,"\n%d/%d:SIGUSR1\n",getpid(),gettid());
 			break;
 		default:
@@ -647,14 +704,27 @@ int main(int argc,char **argv){
 	off_t foff;
 	enum __proto proto;
 	ssize_t r;
-	struct timeval sleptime;
 	int fd;
+#ifdef RELEASE
+	if(strcmp(bfname(argv[0]),"synkill")==0)
+#else
+	if(strcmp(bfname(argv[0]),"synkill_g")==0||strcmp(bfname(argv[0]),"synkill")==0)
+#endif
+	{
+		errexit("will be supported in the future\n");
+	}
 	if(argc<2){
-		errexit("no argument\nFailed\n");
+		write(STDOUT_FILENO,"--help\n",7);
 		return 0;
 	}
 	for(i=1;i<argc;++i){
-		if(strcmp(argv[i],"--icmp")==0){
+		if(strcmp(argv[i],"--help")==0){
+			write(STDOUT_FILENO,"usage\n",6);
+			return 0;
+		}else if(strcmp(argv[i],"--license")==0){
+			write(STDOUT_FILENO,license,strlen(license));
+			return 0;
+		}else if(strcmp(argv[i],"--icmp")==0){
 			upper_proto=P_ICMP;
 		}else if(strcmp(argv[i],"--icmp-seq-rand")==0){
 			icmp_seqmode=RAND;
@@ -717,7 +787,7 @@ int main(int argc,char **argv){
 			check_mode=CHECK_EPOLL;
 		}else if(strcmp(argv[i],"--check-no")==0){
 			check_mode=CHECK_NO;
-		}else if(strcmp(argv[i],"-t")==0){
+		}else if(strcmp(argv[i],"-t")==0||strcmp(argv[i],"--target")==0){
 			if(i==argc-1){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
@@ -745,7 +815,19 @@ int main(int argc,char **argv){
 			r0=sscanf(argv[++i],"%lu",&count);
 			if(r0<1)goto err_sarg;
 			count_written=0;
-		}else if(strcmp(argv[i],"--thread")==0){
+		}else if(strcmp(argv[i],"--timeout")==0){
+			if(i==argc-1){
+				fprintf(stderr,"no argument after %s\n",argv[i]);
+				errexit("Failed\n");
+			}
+			r0=dat2spec(argv[++i],&cts);
+			if(r0<1)goto err_sarg;
+			//ctv.tv_sec=cts_tv_sec;
+			//ctv.tv_usec=cts_tv_nsec/1000;
+			ctout=cts.tv_sec*1000000+cts.tv_nsec/1000;
+			pcts=&cts;
+			//pctv=&ctv;
+		} else if(strcmp(argv[i],"--thread")==0||strcmp(argv[i],"-T")==0){
 			if(i==argc-1){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
@@ -778,20 +860,18 @@ int main(int argc,char **argv){
 				errexit("Failed\n");
 			}
 			sleep_between_sents=1;
-			r0=dat2nanol(argv[++i],&r1,&r2);
+			r0=dat2spec(argv[++i],&ts);
 			if(r0<1)goto err_sarg;
-			if(r0<2){
-				r2=0;
-			}
-			ts.tv_sec=r1;
-			ts.tv_nsec=r2;
-		}else {
+		}else if(argv[i][0]!='-'){
+			target=argv[i];
+		}else{
 err_sarg:
 			fprintf(stderr,"invaild argument:%s (after %s)\n",argv[i],argv[i-1]);
 			errexit("Failed\n");
 		}
 	}
 	//arg processing completed
+	pid=getpid();
 	signal(SIGINT,psig);
 	//signal(SIGABRT,psig);
 	signal(SIGUSR1,psig);
@@ -800,6 +880,9 @@ err_sarg:
 	if(check_mode==CHECK_NONE)check_mode=CHECK_NO;
 	if(target!=NULL)fprintf(stderr,"target (%s)\n",target);
 	else errexit("no target\nFailed\n");
+	if(inet_aton(target,&ip_addr)==0){
+		errexit("invaild target\nFailed\n");
+	}
 	i=0;
 	if(upper_proto==P_NONE)upper_proto=P_ICMP;
 	if(base_proto==P_NONE)base_proto=upper_proto;
@@ -894,7 +977,7 @@ cannot_reseek:
 		targ[r1].end=0;
 		targ[r1].mutex=0;
 	//	pthread_mutex_init(&targ[r1].mutex,NULL);
-		if(clone(prewriting,tstack+TSTACK_SIZE+r1*TSTACK_SIZE,CLONE_FS|CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_PTRACE,targ+r1)<0){
+		if((targ[r1].tid=clone(prewriting,tstack+TSTACK_SIZE+r1*TSTACK_SIZE,CLONE_FS|CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_PTRACE,targ+r1))<0){
 			fprintf(stderr,"cannot cteate thread %ld:%s\n",r1,strerror(errno));
 			targ[r1].id=-1;
 			continue;
@@ -932,7 +1015,7 @@ cannot_reseek:
 		//printf("t %ld end\n",targ[r1].id);
 	}
 	if(fd>0){
-		tgkill(getpid(),fd,SIGUSR1);
+		tgkill(pid,fd,SIGUSR1);
 		waitf(&read_stdin_mutex,0);
 	}
 	if(r2<cthreads){
@@ -959,3 +1042,4 @@ err0:
 	errexit("Failed\n");
 return -1;
 }
+
