@@ -66,7 +66,7 @@ char mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_ttl=64,ip_tlen;
 end packet option*/
 char sleep_between_sents=0,running,count_written=0,update_ok=1,recv_pack=0,epet=0;
 char *target=NULL,*source=NULL,*bind_device=NULL,*data_from_file=NULL,*tstack;
-size_t packlen,data_size=0,sent_sum=0,sent_sum_ok=0,count=0,sent_sum_size=0,aborted_sum=0,nerror_sum=0,sndbuf=0;
+size_t packlen,data_size=0,sent_sum=0,sent_sum_ok=0,count=0,sent_sum_size=0,aborted_sum=0,nerror_sum=0,sndbuf=0,nnetdown=0;
 void (*phdr[MAX_NPROCESS])(void *s,size_t offset,struct argandret *aar);
 size_t (*fhdr[MAX_NPROCESS])(void *s,size_t offset,struct argandret *aar);
 size_t offsets[MAX_NPROCESS];
@@ -94,45 +94,65 @@ char ifname[IFNAMSIZ];
 //#define clone(x,y,z,t) (-1)
 //#define malloc(x) NULL
 #define ARP_PATH "/proc/net/arp"
-int ip2ifmac(char *restrict ascip,char *restrict ascif,char *restrict ascmac){
-	int fd,i;
-	ssize_t r,bufsiz;
-	char *buf;
-	char *stbuf,*p;
+int localip(const char *restrict ifname,struct in_addr *restrict ip){
 	struct ifreq ir;
-	struct in_addr in;
-	if(ascip==NULL)return 0;
-	if(*ascif!=0){
-		fd=socket(AF_INET,SOCK_DGRAM,0);
-		if(fd<0)return -errno;
-		memset(&ir,0,sizeof(ir));
-		ir.ifr_addr.sa_family=AF_INET;
-		strcpy(ir.ifr_name,bind_device?bind_device:ascif);
-		if(ioctl(fd,SIOCGIFADDR,&ir)<0){
-			i=errno;
-			close(fd);
-			return -i;
-		}
-	if(*ascip!=0){
-		if(inet_aton(ascip,&in)==0){
-			close(fd);
-			return 0;
-		}
-		if(memcmp(&((struct sockaddr_in *)&ir.ifr_addr)->sin_addr,&in,sizeof(in))!=0){
-			close(fd);
-			goto readarp;
-		}
-	}else inet_ntop(AF_INET,&((struct sockaddr_in *)&ir.ifr_addr)->sin_addr,ascip,INPUT_SIZE);
-		if(ioctl(fd,SIOCGIFHWADDR,&ir)<0){
-			i=errno;
-			close(fd);
-			return -i;
-		}
-		ether_ntoa_r((struct ether_addr *)ir.ifr_addr.sa_data,ascmac);
+	int fd,i;
+	fd=socket(AF_INET,SOCK_DGRAM,0);
+	if(fd<0)return -errno;
+	memset(&ir,0,sizeof(ir));
+	ir.ifr_addr.sa_family=AF_INET;
+	strcpy(ir.ifr_name,ifname);
+	if(ioctl(fd,SIOCGIFADDR,&ir)<0){
+		i=errno;
 		close(fd);
-		return 2;
+		return -i;
 	}
+	memcpy(ip,&((struct sockaddr_in *)&ir.ifr_addr)->sin_addr,sizeof(struct in_addr));
+	close(fd);
+	return 1;
+}
+int localmac(const char *restrict ifname,uint8_t *restrict mac){
+	struct ifreq ir;
+	int fd,i;
+	fd=socket(AF_INET,SOCK_DGRAM,0);
+	if(fd<0)return -errno;
+	memset(&ir,0,sizeof(ir));
+	ir.ifr_addr.sa_family=AF_INET;
+	strcpy(ir.ifr_name,ifname);
+	if(ioctl(fd,SIOCGIFHWADDR,&ir)<0){
+		i=errno;
+		close(fd);
+		return -i;
+	}
+	memcpy(mac,ir.ifr_addr.sa_data,ETH_ALEN);
+	close(fd);
+	return 1;
+}
+int ip2mac(const char *restrict ifname,const struct in_addr *restrict ip,uint8_t *restrict mac){
+	int fd,i;
+	struct arpreq ar;
+	struct in_addr in;
+	if((i=localip(ifname,&in))<0)return i;
+	if(memcmp(ip,&in,sizeof(in))==0){
+		return localmac(ifname,mac);
+	}
+//read arp cache
+	fd=socket(AF_INET,SOCK_DGRAM,0);
+	if(fd<0)return -errno;
+	memset(&ar,0,sizeof(ar));
+	strcpy(ar.arp_dev,ifname);
+	ar.arp_pa.sa_family=AF_INET;
+	memcpy(&((struct sockaddr_in *)&ar.arp_pa)->sin_addr,ip,sizeof(struct in_addr));
+	if(ioctl(fd,SIOCGARP,&ar)<0){
+		i=errno;
+		close(fd);
+		return -i;
+	}
+	memcpy(mac,ar.arp_ha.sa_data,ETH_ALEN);
+	close(fd);
+	return 1;
 
+/*
 readarp:
 	fd=open(ARP_PATH,O_RDONLY);
 	if(fd<0)return -errno;
@@ -179,7 +199,7 @@ readarp:
 		}
 	}
 	free(buf);
-	return 0;
+	return 0;*/
 }
 int ifname2index(int fd,const char *restrict name){
 	struct ifreq ir;
@@ -299,18 +319,39 @@ void errexit(const char *msg){
 	write(STDERR_FILENO,msg,strlen(msg));
 	exit(1);
 }
+void memrand(void *restrict m,size_t n){
+#if (RAND_MAX>=UINT32_MAX)
+	while(n>=4){
+		*(uint32_t *)m=(uint32_t)rand();
+		n-=4;
+	}
+#endif
+#if (RAND_MAX>=UINT16_MAX)
+	while(n>=2){
+		*(uint16_t *)m=(uint16_t)rand();
+		n-=2;
+	}
+#endif
+	while(n>0){
+		*(uint8_t *)m=(uint8_t)rand();
+		--n;
+	}
+
+}
 uint16_t icmp_seq0=0,icmp_type=ICMP_ECHO,icmp_echoid=0;
-uint16_t port_t=0,port_s=0,eth_protocol=0,ip_id=0,ip_tlen=0;;
+uint16_t port_t=0,port_s=0,eth_protocol=0,ip_id=0,ip_tlen=0;
 struct in_addr ip_addr_t,ip_addr_s;
-uint8_t mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0;
+uint8_t mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0,icmp_seq_fillrand=0,icmp_id_fillrand=1,ip_id_fillrand=1;
 size_t fill_icmphdr(void *s,size_t offset,struct argandret *aar){
 	struct icmphdr *h;
 	h=(struct icmphdr *)((char *)s+offset);
 	h->type=icmp_type;
-	h->un.echo.sequence=htons(icmp_seq0);
-	h->un.echo.id=htons(icmp_echoid);
+	if(icmp_seq_fillrand)memrand(&aar->icmp_seqc,sizeof(uint16_t));else
 	aar->icmp_seqc=icmp_seq0;
+	h->un.echo.sequence=htons(aar->icmp_seqc);
+	if(icmp_id_fillrand)memrand(&aar->icmp_idc,sizeof(uint16_t));else
 	aar->icmp_idc=icmp_echoid;
+	h->un.echo.id=htons(aar->icmp_idc);
 	return sizeof(*h);
 }
 size_t fill_ethhdr(void *s,size_t offset,struct argandret *aar){
@@ -328,8 +369,9 @@ size_t fill_iphdr(void *s,size_t offset,struct argandret *aar){
 	h->ihl=sizeof(struct iphdr)/4;
 	h->tos=0;
 	h->tot_len=htons(ip_tlen);
-	h->id=htons(ip_id);
+	if(ip_id_fillrand)memrand(&aar->ip_idc,sizeof(uint16_t));else
 	aar->ip_idc=ip_id;
+	h->id=htons(aar->ip_idc);
 	h->frag_off|=htons(IP_DF);
 	h->ttl=ip_ttl;
 	h->protocol=ip_protocol;
@@ -669,8 +711,17 @@ noerr:
 	++sent;
 	if(r<0){
 		r0=errno;
-//		if((r0!=EWOULDBLOCK&&r0!=EAGAIN)||!epet){
 		++nerror;
+		if(r0==ENETDOWN&&running){
+			pthread_mutex_lock(&gmutex);
+			r1=sprintf(inputp,"\n%ld: ENETDOWN at writing %lu th packet (%lu times),sleep\n",id,sent,++nnetdown);
+			write(STDERR_FILENO,inputp,r1);
+			pthread_mutex_unlock(&gmutex);
+			nanosleep(&cts,NULL);
+			goto noerr;
+		}
+
+//		if((r0!=EWOULDBLOCK&&r0!=EAGAIN)||!epet){
 		if(lasterr!=r0&&(r0=newerr(r0))){
 			r1=sprintf(inputp,"\n%ld: error at writing %lu th packet:%s (same errors following will be hidden)\n",id,sent,strerror(r0));
 			write(STDERR_FILENO,inputp,r1);
@@ -871,11 +922,9 @@ int read_stdin(void *arg){
 		FD_SET(STDIN_FILENO,&fds);
 		if(select(STDIN_FILENO+1,&fds,NULL,NULL,NULL)<0){
 			
-	//fprintf(stderr,"\n%d/%d:selecterr\n",getpid(),gettid());
 			break;
 		}
 		if(!FD_ISSET(STDIN_FILENO,&fds))break;
-	//fprintf(stderr,"\n%d/%d:select\n",getpid(),gettid());
 		r=read(STDIN_FILENO,input,INPUT_SIZE);
 		if(r==0){
 end:
@@ -1011,9 +1060,9 @@ int main(int argc,char **argv){
 	enum __proto proto;
 	ssize_t r;
 	int fd;
+	struct in_addr iptmp;
 	srand(time(NULL));
-	icmp_echoid=(uint16_t)rand();
-	ip_id=(uint16_t)rand();
+	dat2spec("2.0",&cts);
 #ifdef RELEASE
 	if(strcmp(bfname(argv[0]),"synkill")==0)
 #else
@@ -1066,6 +1115,7 @@ int main(int argc,char **argv){
 			}
 			r0=sscanf(argv[++i],"%hu",&icmp_seq0);
 			if(r0<1)goto err_sarg;
+			icmp_seq_fillrand=0;
 		}else if(strcmp(argv[i],"--icmp-id-inc")==0){
 			icmp_idmode=INC;
 		}else if(strcmp(argv[i],"--icmp-id-dec")==0){
@@ -1081,6 +1131,7 @@ int main(int argc,char **argv){
 			}
 			r0=sscanf(argv[++i],"%hu",&icmp_echoid);
 			if(r0<1)goto err_sarg;
+			icmp_id_fillrand=0;
 		}else if(strcmp(argv[i],"--icmp-sock-raw")==0){
 			icmp_sock_type=TYPE_RAW;
 		}else if(strcmp(argv[i],"--icmp-sock-dgram")==0){
@@ -1176,6 +1227,7 @@ int main(int argc,char **argv){
 			}
 			r0=sscanf(argv[++i],"%hu",&ip_id);
 			if(r0<1)goto err_sarg;
+			ip_id_fillrand=0;
 		}else if(strcmp(argv[i],"--ip-ttl")==0||strcmp(argv[i],"-TTL")==0){
 			if(i==argc-1){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
@@ -1280,59 +1332,67 @@ err_sarg:
 	}
 	else if(base_proto!=P_RAW&&base_proto!=P_ETHER)errexit("no target\nFailed\n");
 	if((base_proto==P_ETHER||base_proto==P_RAW)){
-	if(!mac_t_c||!bind_device){
 	if(bind_device)strcpy(ifname,bind_device);
-	else *ifname=0;
-	fd=ip2ifmac(target,ifname,input1);
-	if(!bind_device&&fd<2){
-		fprintf(stderr,"cannot select device automatically (%s),specify with -i\n",fd<0?strerror(-fd):(target?"No arp cache":"No target"));
+	else{
+		fprintf(stderr,"cannot select device automatically"/* (%s)*/",specify with -i\n"/*,fd<0?strerror(-fd):(target?"No arp cache":"No target")*/);
 		errexit("Failed\n");
 	}
 	if(!ip_addr_t_c){
-			if(!target&&fd<2){
-			fprintf(stderr,"cannot get target ip automatically on (%s) (%s),specify with -t or --ip-dst\n",bind_device?bind_device:ifname,fd<0?strerror(-fd):"???");
-			errexit("Failed\n");
-		}else if(inet_aton(target,&ip_addr_s)==0){
-			errexit("invaild target\nFailed\n");
-			}
+		if(!target){
+		fprintf(stderr,"cannot get target ip automatically on (%s),specify with -t or --ip-dst\n",ifname);
+		errexit("Failed\n");
+	}else if(inet_aton(target,&ip_addr_t)==0){
+		errexit("invaild target\nFailed\n");
+		}
 	}
 
 	if(!mac_t_c){
+		if(!target){
+			fd=0;
+		}
+		else if(inet_aton(target,&iptmp)==0){
+		errexit("invaild target\nFailed\n");
+		return -1;
+		}else fd=ip2mac(ifname,&iptmp,mac_t);
 		if(fd<1){
 			fprintf(stderr,"cannot get dest mac automatically on (%s) (%s),specify with --mac-dst\n",bind_device?bind_device:ifname,fd<0?strerror(-fd):(target?"No arp cache":"No target"));
 			errexit("Failed\n");
 		}else {
+			ether_ntoa_r((struct ether_addr *)mac_t,input1);
 			fprintf(stderr,"target mac (%s)\n",input1);
-			ether_aton_r(input1,(struct ether_addr *)mac_t);
 		}
 	
 	}
-	}
-	if(!ip_addr_s_c&&!mac_s_c){
-	if(source)strcpy(source_buf,source);
-	else *source_buf=0;
-	fd=ip2ifmac(source_buf,bind_device?bind_device:ifname,input1);
-	fprintf(stderr,"source (%s)\n",source_buf);
 	if(!ip_addr_s_c){
-			if(!source&&fd<2){
-			fprintf(stderr,"cannot get source ip automatically on (%s) (%s),specify with -s or --ip-src\n",bind_device?bind_device:ifname,fd<0?strerror(-fd):"???");
-			errexit("Failed\n");
-		}else if(inet_aton(source_buf,&ip_addr_s)==0){
+			if(source){
+			if(inet_aton(source,&ip_addr_s)==0){
 			errexit("invaild source\nFailed\n");
 			}
+			}else if(localip(ifname,&ip_addr_s)<1){
+			fprintf(stderr,"cannot get source ip automatically on (%s) (%s),specify with -s or --ip-src\n",ifname,fd<0?strerror(-fd):"???");
+			errexit("Failed\n");
+			}
+			inet_ntop(AF_INET,&ip_addr_s,input1,INPUT_SIZE);
+			fprintf(stderr,"source ip (%s)\n",input1);
+
 	}
 	if(!mac_s_c){
+		if(source){
+		if(inet_aton(source,&iptmp)==0){
+		errexit("invaild source\nFailed\n");
+			}
+		fd=ip2mac(ifname,&iptmp,mac_s);
+		}else fd=localmac(ifname,mac_s);
 		if(fd<1){
-			fprintf(stderr,"cannot get source mac automatically on (%s) (%s),specify with --mac-src\n",bind_device?bind_device:ifname,fd<0?strerror(-fd):"No arp cache");
+			fprintf(stderr,"cannot get source mac automatically on (%s) (%s),specify with --mac-src\n",ifname,fd<0?strerror(-fd):"No arp cache");
 			errexit("Failed\n");
 		}else {
+			ether_ntoa_r((struct ether_addr *)mac_s,input1);
 			fprintf(stderr,"source mac (%s)\n",input1);
-			ether_aton_r(input1,(struct ether_addr *)mac_s);
 		}
 	
 	}
-	}
-		fprintf(stderr,"on (%s)\n",bind_device?bind_device:ifname);
+		fprintf(stderr,"on (%s)\n",ifname);
 	}
 	i=0;
 	if(upper_proto==P_NONE)upper_proto=P_ICMP;
@@ -1482,10 +1542,15 @@ cannot_reseek:
 	//	r=read(STDIN_FILENO,input,INPUT_SIZE);
 	//	if(r==0)running=0;
 	//}
-	r2=0;
-	for(r1=0;r1<nthreads;++r1){
-		if(targ[r1].id==-1)continue;
-		waitf(&targ[r1].mutex,0);
+	r1=r2=0;
+	while(r1<nthreads){
+		if(targ[r1].id==-1){
+			++r1;
+			continue;
+		}
+		if(waitf(&targ[r1].mutex,0)<0&&errno==EINTR){
+			continue;
+		}
 		sent_sum+=targ[r1].sent;
 		sent_sum_ok+=targ[r1].sent_ok;
 		sent_sum_size+=targ[r1].sent_size;
@@ -1493,6 +1558,7 @@ cannot_reseek:
 		nerror_sum+=targ[r1].nerror;
 		if(targ[r1].end==1)++r2;
 		//printf("t %ld end\n",targ[r1].id);
+		++r1;
 	}
 	if(fd>0){
 		tgkill(pid,fd,SIGUSR1);
