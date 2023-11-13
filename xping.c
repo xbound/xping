@@ -1449,6 +1449,12 @@ main_arg:
 			}
 			source=argv[++i];
 			base_proto=P_ETHER;
+		}else if(strcmp(argv[i],"-s-rand")==0||strcmp(argv[i],"--source-rand")==0){
+			mac_srcmode=RAND;
+			mac_s_c=1;
+			ip_srcmode=RAND;
+			ip_addr_s_c=1;
+			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"-t")==0||strcmp(argv[i],"--target")==0){
 			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
