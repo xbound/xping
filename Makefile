@@ -1,5 +1,7 @@
 CC := gcc
-CFLAG := -Wall -lc -lpthread -DDOC_BIN
+LBFLAG := -DLICENSE_BIN
+HBFLAG := -DHELP_BIN
+CFLAG := -Wall -lc -lpthread $(HBFLAG) $(LBFLAG)
 RFLAG := -Ofast -DRELEASE
 DFLAG := -O0 -g
 kernel := $(shell uname -r)
