@@ -122,6 +122,23 @@ int localip(const char *restrict ifname,struct in_addr *restrict ip){
 	close(fd);
 	return 1;
 }
+int localnetmask(const char *restrict ifname,struct in_addr *restrict ip){
+	struct ifreq ir;
+	int fd,i;
+	fd=socket(AF_INET,SOCK_DGRAM,0);
+	if(fd<0)return -errno;
+	memset(&ir,0,sizeof(ir));
+	ir.ifr_addr.sa_family=AF_INET;
+	strcpy(ir.ifr_name,ifname);
+	if(ioctl(fd,SIOCGIFNETMASK,&ir)<0){
+		i=errno;
+		close(fd);
+		return -i;
+	}
+	memcpy(ip,&((struct sockaddr_in *)&ir.ifr_addr)->sin_addr,sizeof(struct in_addr));
+	close(fd);
+	return 1;
+}
 int localmac(const char *restrict ifname,uint8_t *restrict mac){
 	struct ifreq ir;
 	int fd,i;
@@ -377,12 +394,116 @@ void memrand(void *restrict m,size_t n){
 	}
 
 }
+void memnot(void *restrict m,size_t n){
+	while(n>=8){
+		*(uint64_t *)m=~*(uint64_t *)m;
+		*(char *)&m+=8;
+		n-=8;
+	}
+	while(n>=4){
+		*(uint32_t *)m=~*(uint32_t *)m;
+		*(char *)&m+=4;
+		n-=4;
+	}
+	while(n>=2){
+		*(uint16_t *)m=~*(uint16_t *)m;
+		*(char *)&m+=2;
+		n-=2;
+	}
+	while(n>0){
+		*(uint8_t *)m=~*(uint8_t *)m;
+		*(char *)&m+=1;
+		--n;
+	}
+
+}
+void memand(void *restrict d,void *restrict s,size_t n){
+	while(n>=8){
+		*(uint64_t *)d&=*(uint64_t *)s;
+		*(char *)&d+=8;
+		*(char *)&s+=8;
+		n-=8;
+	}
+	while(n>=4){
+		*(uint32_t *)d&=*(uint32_t *)s;
+		*(char *)&d+=4;
+		*(char *)&s+=4;
+		n-=4;
+	}
+	while(n>=2){
+		*(uint16_t *)d&=*(uint16_t *)s;
+		*(char *)&d+=2;
+		*(char *)&s+=2;
+		n-=2;
+	}
+	while(n>0){
+		*(uint8_t *)d&=*(uint8_t *)s;
+		*(char *)&d+=1;
+		*(char *)&s+=1;
+		--n;
+	}
+
+}
+void memor(void *restrict d,void *restrict s,size_t n){
+	while(n>=8){
+		*(uint64_t *)d|=*(uint64_t *)s;
+		*(char *)&d+=8;
+		*(char *)&s+=8;
+		n-=8;
+	}
+	while(n>=4){
+		*(uint32_t *)d|=*(uint32_t *)s;
+		*(char *)&d+=4;
+		*(char *)&s+=4;
+		n-=4;
+	}
+	while(n>=2){
+		*(uint16_t *)d|=*(uint16_t *)s;
+		*(char *)&d+=2;
+		*(char *)&s+=2;
+		n-=2;
+	}
+	while(n>0){
+		*(uint8_t *)d|=*(uint8_t *)s;
+		*(char *)&d+=1;
+		*(char *)&s+=1;
+		--n;
+	}
+
+}
+void memxor(void *restrict d,void *restrict s,size_t n){
+	while(n>=8){
+		*(uint64_t *)d^=*(uint64_t *)s;
+		*(char *)&d+=8;
+		*(char *)&s+=8;
+		n-=8;
+	}
+	while(n>=4){
+		*(uint32_t *)d^=*(uint32_t *)s;
+		*(char *)&d+=4;
+		*(char *)&s+=4;
+		n-=4;
+	}
+	while(n>=2){
+		*(uint16_t *)d^=*(uint16_t *)s;
+		*(char *)&d+=2;
+		*(char *)&s+=2;
+		n-=2;
+	}
+	while(n>0){
+		*(uint8_t *)d^=*(uint8_t *)s;
+		*(char *)&d+=1;
+		*(char *)&s+=1;
+		--n;
+	}
+
+}
 enum vlmode {INC,RAND,DEC,FIX} icmp_seqmode=INC,icmp_idmode=FIX,ip_idmode=INC,port_srcmode=FIX,port_dstmode=FIX,tcp_seqmode=RAND,tcp_windowmode=FIX,mac_srcmode=FIX,ip_srcmode=FIX;
 uint32_t tcp_seq=0;
 uint16_t icmp_seq0=0,icmp_type=ICMP_ECHO,icmp_echoid=0;
 uint16_t port_t=0,port_s=0,eth_protocol=0,ip_id=0,ip_tlen=0,tcp_window=512;
-struct in_addr ip_addr_t,ip_addr_s;
-uint8_t mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0,icmp_seq_fillrand=0,icmp_id_fillrand=1,ip_id_fillrand=1,port_dst_fillrand=0,port_src_fillrand=1,tcp_seq_fillrand=0;
+struct in_addr ip_addr_t,ip_addr_s,ip_mask,ip_masknot,ip_supernet;
+uint8_t mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0,icmp_seq_fillrand=0,icmp_id_fillrand=1,ip_id_fillrand=1,port_dst_fillrand=0,port_src_fillrand=1,tcp_seq_fillrand=0,ip_randmask=0;
 char *tcp_flag;
 size_t fill_icmphdr(void *s,size_t offset,struct argandret *aar){
 	struct icmphdr *h;
@@ -589,6 +710,10 @@ void process_iphdr(void *s,size_t offset,struct argandret *aar){
 	switch(ip_srcmode){
 		case RAND:
 			memrand(&aar->ip_src,sizeof(struct in_addr));
+			if(ip_randmask){
+				memand(&aar->ip_src,&ip_masknot,sizeof(struct in_addr));
+				memor(&aar->ip_src,&ip_supernet,sizeof(struct in_addr));
+			}
 			break;
 		default:
 			break;
@@ -1509,6 +1634,8 @@ main_arg:
 			if(r0<1)goto err_sarg;
 			ip_id_fillrand=0;
 			base_proto=P_ETHER;
+		}else if(strcmp(argv[i],"--ip-subnet")==0){
+			ip_randmask=1;
 		}else if(strcmp(argv[i],"--ip-ttl")==0||strcmp(argv[i],"-TTL")==0){
 			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
@@ -1676,6 +1803,19 @@ err_sarg:
 	
 	}
 		fprintf(stderr,"on (%s)\n",ifname);
+	if(ip_randmask){
+		if(localnetmask(ifname,&ip_mask)<0){
+			fprintf(stderr,"cannot get netmask :%s\n",strerror(errno));
+			errexit("Failed\n");
+		}
+		memcpy(&ip_masknot,&ip_mask,sizeof(struct in_addr));
+		memnot(&ip_masknot,sizeof(struct in_addr));
+		if(localip(ifname,&ip_supernet)<0){
+			fprintf(stderr,"cannot get local ip :%s\n",strerror(errno));
+			errexit("Failed\n");
+		}
+		memand(&ip_supernet,&ip_mask,sizeof(struct in_addr));
+	}
 	}
 	i=0;
 	if(upper_proto==P_NONE)upper_proto=P_ICMP;
