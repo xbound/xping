@@ -4,13 +4,22 @@
  ****************************************************************/
 #define _GNU_SOURCE
 char license[]={
-#ifdef LICENSE_BIN
+#ifdef LICENSE_EMBED
 #include "license_bin"
 	,'\n',0x00
 #else 
 	"https://www.gnu.org/licenses/gpl-3.0.txt\n"
 #endif
 };
+char help[]={
+#ifdef HELP_EMBED
+#include "help_bin"
+	,'\n',0x00
+#else 
+	"see help.txt\n"
+#endif
+};
+
 #include <sys/syscall.h>
 #include <linux/futex.h>
 #include <string.h>
@@ -78,7 +87,7 @@ struct timespec cts;
 struct timespec *pcts=NULL;
 //struct timeval *pctv=NULL;
 char ifname[IFNAMSIZ];
-char *synkill_args[]={"synkill","--mac-src-rand","--ip-src-rand","--src-port-rand","-ET","--tcp-flag","s","--ip-id-rand","--tcp-window-rand",NULL};
+char *synkill_args[]={"xping","--src-port-rand","-ET","--tcp-flag","s","--ip-id-rand",NULL};
 //#define epoll_create(x) (-1)
 //#define epoll_ctl(x,y,z,t) (-1)
 //#define clone(x,y,z,t) (-1)
@@ -115,6 +124,23 @@ int localnetmask(const char *restrict ifname,struct in_addr *restrict ip){
 		return -i;
 	}
 	memcpy(ip,&((struct sockaddr_in *)&ir.ifr_addr)->sin_addr,sizeof(struct in_addr));
+	close(fd);
+	return 1;
+}
+int localmtu(const char *restrict ifname,int *restrict mtu){
+	struct ifreq ir;
+	int fd,i;
+	fd=socket(AF_INET,SOCK_DGRAM,0);
+	if(fd<0)return -errno;
+	memset(&ir,0,sizeof(ir));
+	ir.ifr_addr.sa_family=AF_INET;
+	strcpy(ir.ifr_name,ifname);
+	if(ioctl(fd,SIOCGIFMTU,&ir)<0){
+		i=errno;
+		close(fd);
+		return -i;
+	}
+	*mtu=ir.ifr_mtu;
 	close(fd);
 	return 1;
 }
@@ -508,10 +534,11 @@ struct arp{
 }__attribute__((packed));
 enum vlmode {INC,RAND,DEC,FIX} icmp_seqmode=INC,icmp_idmode=FIX,ip_idmode=INC,port_srcmode=FIX,port_dstmode=FIX,tcp_seqmode=RAND,tcp_windowmode=FIX,mac_srcmode=FIX,ip_srcmode=FIX;
 uint32_t tcp_seq=0;
+int mtu=0;
 uint16_t icmp_seq0=0,icmp_echoid=0;
 uint16_t port_t=0,port_s=0,eth_protocol=0,ip_id=0,ip_tlen=0,tcp_window=512,arp_type=ARPOP_REQUEST,arp_otype=0;
 struct in_addr ip_addr_t,ip_addr_s,ip_mask,ip_masknot,ip_supernet,icmp_gateway;
-uint8_t arpmac_s[ETH_ALEN],arpmac_s_c=0,arpmac_t[ETH_ALEN],arpmac_t_c=0,mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0,icmp_type=ICMP_ECHO,icmp_otype=ICMP_ECHO,icmp_code=0,icmp_seq_fillrand=0,icmp_id_fillrand=1,ip_id_fillrand=1,port_dst_fillrand=0,port_src_fillrand=1,tcp_seq_fillrand=0,ip_randmask=0;
+uint8_t arpmac_s[ETH_ALEN],arpmac_s_c=0,arpmac_t[ETH_ALEN],arpmac_t_c=0,mac_s[ETH_ALEN],mac_s_c=0,mac_t[ETH_ALEN],mac_t_c=0,ip_addr_t_c=0,ip_addr_s_c=0,ip_ttl=IPDEFTTL,ip_protocol=0,icmp_type=ICMP_ECHO,icmp_otype=ICMP_ECHO,icmp_code=0,icmp_seq_fillrand=0,icmp_id_fillrand=1,ip_id_fillrand=1,port_dst_fillrand=0,port_src_fillrand=1,tcp_seq_fillrand=0,ip_randmask=0,tcp_window_c=0;
 char *tcp_flag;
 size_t fill_icmphdr(void *s,size_t offset,struct argandret *aar){
 	struct icmphdr *h;
@@ -634,6 +661,13 @@ size_t fill_tcphdr(void *s,size_t offset,struct argandret *aar){
 		case 'u':
 			h->urg=1;
 			break;
+		case 'c':
+			h->cwr=1;
+			break;
+		case 'e':
+			h->ece=1;
+			break;
+
 		default:
 			break;
 	}
@@ -1440,6 +1474,7 @@ void psig(int sig){
 			break;
 	}
 }
+#define strstre(s,cs,p) (p=((p=strstr(s,cs))?p+sizeof(cs)-1:NULL))
 int main(int argc,char **argv){
 	signed long int i,r0,r1,r2;
 	off_t foff;
@@ -1447,7 +1482,7 @@ int main(int argc,char **argv){
 	ssize_t r;
 	int fd;
 	struct in_addr iptmp;
-	char **argv0;
+	char **argv0,*p;
 	srand(time(NULL));
 	dat2spec("2.0",&cts);
 	argv0=argv;
@@ -1463,15 +1498,31 @@ int main(int argc,char **argv){
 		goto main_arg;
 after_synkill_arg:
 		argv=argv0;
+	if(argc<2){
+		strstre(help,"#help-synkill\n",p);
+		if(p)
+		write(STDOUT_FILENO,p,strstr(p,"#end-help-synkill")-p);
+		else write(STDOUT_FILENO,help,sizeof(help)-1);
+		return 0;
+	}
 		goto main_arg;
 	}
 	if(argc<2){
-		write(STDOUT_FILENO,"--help\n",7);
+		write(STDOUT_FILENO,"Try '--help' for more information.\n",sizeof("Try '--help' for more information."));
 		return 0;
 	}
 main_arg:
 	for(i=1;argv[i];++i){
-		if(strcmp(argv[i],"--mac-dst")==0||strcmp(argv[i],"--eth-dst")==0){
+		if(strcmp(argv[i],"--help")==0){
+			strstre(help,"#help-xping\n",p);
+			if(p)
+			write(STDOUT_FILENO,p,strstr(p,"#end-help-xping")-p);
+			else write(STDOUT_FILENO,help,sizeof(help)-1);
+			return 0;
+		}else if(strcmp(argv[i],"--license")==0){
+			write(STDOUT_FILENO,license,sizeof(license)-1);
+			return 0;
+		}else if(strcmp(argv[i],"--mac-dst")==0||strcmp(argv[i],"--eth-dst")==0){
 			if(!argv[i+1]){
 				fprintf(stderr,"no argument after %s\n",argv[i]);
 				errexit("Failed\n");
@@ -1487,16 +1538,11 @@ main_arg:
 			if(ether_aton_r(argv[++i],(struct ether_addr *)mac_s)==NULL)goto err_sarg;
 			mac_s_c=1;
 			base_proto=P_ETHER;
+			mac_srcmode=FIX;
 		}else if(strcmp(argv[i],"--mac-src-rand")==0||strcmp(argv[i],"--eth-src-rand")==0){
 			mac_srcmode=RAND;
 			mac_s_c=1;
 			base_proto=P_ETHER;
-		}else if(strcmp(argv[i],"--help")==0){
-			write(STDOUT_FILENO,"see help.txt\n",13);
-			return 0;
-		}else if(strcmp(argv[i],"--license")==0){
-			write(STDOUT_FILENO,license,sizeof(license)-1);
-			return 0;
 		}else if(strcmp(argv[i],"--icmp")==0){
 			upper_proto=P_ICMP;
 		}else if(strcmp(argv[i],"--icmp-redirect")==0){
@@ -1648,6 +1694,7 @@ main_arg:
 			r0=sscanf(argv[++i],"%hu",&tcp_window);
 			if(r0<1)goto err_sarg;
 			tcp_windowmode=FIX;
+			tcp_window_c=1;
 		}else if(strcmp(argv[i],"--raw")==0){
 			base_proto=P_RAW;
 		}else if(strcmp(argv[i],"--update-force")==0){
@@ -1713,6 +1760,7 @@ main_arg:
 			if(r0<1)goto err_sarg;
 			ip_addr_s_c=1;
 			base_proto=P_ETHER;
+			ip_srcmode=FIX;
 		}else if(strcmp(argv[i],"--ip-src-rand")==0){
 			ip_srcmode=RAND;
 			ip_addr_s_c=1;
@@ -1884,7 +1932,7 @@ err_sarg:
 	running=1;
 	if(recv_pack)read_packet(NULL);
 	if(check_mode==CHECK_NONE)check_mode=CHECK_NO;
-	if(target!=NULL){
+	if(target!=NULL&&base_proto!=P_ETHER&&base_proto!=P_RAW){
 		fprintf(stderr,"target (%s)\n",target);
 	if(inet_aton(target,&ip_addr_t)==0){
 		errexit("invaild target\nFailed\n");
@@ -1899,10 +1947,20 @@ err_sarg:
 	}
 	if(!ip_addr_t_c){
 		if(!target){
-		fprintf(stderr,"cannot get target ip automatically on (%s),specify with -t or --ip-dst\n",ifname);
+			if(upper_proto==P_ARP&&arp_otype==ARPOP_RREQUEST){
+				inet_aton("0.0.0.0",&ip_addr_t);
+				goto rarp_request;
+			}
+
+		fprintf(stderr,"cannot get dest ip automatically on (%s),specify with -t or --ip-dst\n",ifname);
 		errexit("Failed\n");
 	}else if(inet_aton(target,&ip_addr_t)==0){
 		errexit("invaild target\nFailed\n");
+		}else {
+rarp_request:
+			inet_ntop(AF_INET,&ip_addr_t,input1,INPUT_SIZE);
+			fprintf(stderr,"dest ip (%s)\n",input1);
+
 		}
 	}
 
@@ -1953,6 +2011,7 @@ arp_request:
 		fd=ip2mac(ifname,&iptmp,mac_s);
 		}else fd=localmac(ifname,mac_s);
 		if(fd<1){
+
 			fprintf(stderr,"cannot get source mac automatically on (%s) (%s),specify with --mac-src\n",ifname,fd<0?strerror(-fd):"No arp cache");
 			errexit("Failed\n");
 		}else {
@@ -1975,6 +2034,7 @@ arp_request:
 		}
 		memand(&ip_supernet,&ip_mask,sizeof(struct in_addr));
 	}
+
 	}
 	i=0;
 	if(upper_proto==P_NONE)upper_proto=P_ICMP;
@@ -2043,10 +2103,13 @@ arp_request:
 		case P_TCP:
 			fhdr[i]=fill_tcphdr;
 			phdr[i]=process_tcphdr;
-			packlen+=sizeof(struct tcphdr);
 			++i;
 			ip_protocol=IPPROTO_TCP;
 			proto=P_NONE;
+			if(!tcp_window_c&&localmtu(ifname,&mtu)>=0){
+				tcp_window=mtu-(packlen-sizeof(struct ethhdr));
+			}
+			packlen+=sizeof(struct tcphdr);
 			break;
 		case P_ARP:
 			fhdr[i]=fill_arp;
@@ -2146,6 +2209,7 @@ cannot_reseek:
 	pthread_mutex_lock(&gmutex);
 	r2=(rthreads<cthreads);
 	pthread_mutex_unlock(&gmutex);
+	sched_yield();
 	}
 	fprintf(stderr,"%ld threads started\n",cthreads);
 	signal(SIGINT,psig);

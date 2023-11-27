@@ -1,0 +1,88 @@
+#help-xping
+Usage: xping [options] [-t] host [-s host|-s-rand]
+	--help	display this help and exit
+	--license	display the license of xping and exit
+	-t, --target	clear the next argument is target host,omissible
+	-s, --source host	writer of packets (Mimicry,use the current host as default)
+	-s-rand, --source-rand	randomize the writer of packets,equivalence to --mac-src-rand --ip-src-rand
+	-i interface	which ethernet device/interface to use
+	-T, --thread N	use N threads
+	--sleep X	sleep X seconds between writing packets
+	-cw, --count-written N	stop after writing N packets
+	-c, --count N	stop after trying to write N packets
+	--check, --check-auto	call epoll or select before writing
+	--check-epoll	call epoll before writing
+	--check-select	call select before writing
+	-ET, --check-epollet	use EPOLLET option in epoll,enable --check-epoll automatically
+	--timeout X	timeout for --check and sleeping when ENETDOWN or ENETUNREACH
+	--alarm, --alrm N	call alarm(N) at start
+	--size SIZE	append SIZE zero(if --data not given) bytes to each packet (default: 0)
+	--data file	append data from file to each packet,for these case:
+		--size is not given or SIZE==0 or SIZE==filesize	appended data equals to the file
+		SIZE<filesize	appended data will be truncate to SIZE bytes 
+		SIZE>filesize	extra bytes after appended data will be filled with zero
+	--sendbuf, --sndbuf N	set SO_SNDBUF before writing packets
+	--update-force	update data of packet however it was written
+	--update-ok	update data of packet when it was written (default)
+	--raw	write raw ethernet frame,may fail if size of packet < 14
+	--icmp	write ICMP packets (default)
+		--icmp-sock-auto	use SOCK_DGRAM if SOCK_RAW is unavailable (default)
+		--icmp-sock-dgram	use SOCK_DGRAM to write ICMP packet explicitly
+		--icmp-sock-raw	use SOCK_RAW to write ICMP packet explicitly
+		--icmp-echo	use ICMP_ECHO as ICMP type (default)
+		--icmp-reply	use ICMP_ECHOREPLY as ICMP type
+		--icmp-code N	use N as ICMP code
+		--icmp-id N	use N as ICMP echo id
+		--icmp-id-(rand|inc|dec|fix)	set how ICMP echo id varies (randomize,increase,decrease,fix),default: fix
+		--icmp-seq N	use N as ICMP echo sequence
+		--icmp-seq-(rand|inc|dec|fix)	set how ICMP echo sequence varies (randomize,increase,decrease,fix),default: inc
+		--icmp-type N	use N as ICMP type
+		--icmp-redirect IP	write ICMP redirect(to IP) packet
+	-p, --port N	set target port to N (default: 0)
+	--src-port N	set source port to N
+	--tcp	write TCP packets
+		--tcp-flag A	enable flags in tcp header,according to chars in A
+			s:SYN
+			a:ACK
+			r:RST
+			f:FIN
+			p:PSH
+			u:URG
+			c:CWR
+			e:ECE
+		--tcp-seq N	set TCP sequence to N
+		--tcp-seq-(rand|inc|dec|fix)	set how TCP sequence varies (randomize,increase,decrease,fix),default: rand
+		--tcp-window N	set TCP window to N
+		--tcp-window-(rand|inc|dec|fix)	set how TCP window varies (randomize,increase,decrease,fix),default: fix
+	--ip	write IP packets
+		--ip-dst IP	set destination ip to IP
+		--ip-src IP	set source ip to IP
+		--ip-src-rand	randomize source ip
+		--ip-subnet	use random IP in current subnet (work with --ip-src-rand)
+		--ip-id N	use N as IP id
+		--ip-id-(rand|inc|dec|fix)	set how IP id varies (randomize,increase,decrease,fix),default: inc
+	--arp	write ARP packets
+		--arp-echo, --arp-request	write ARP request packets
+		--arp-reply	write ARP reply packets
+		--rarp-echo, --rarp-request	write RARP request packets
+		--rarp-reply	write RARP reply packets
+		--arp-type, --arp-op N	set ARP type to N
+		--arp-mac-dst MAC	set destnation mac in ARP header to MAC
+		--arp-src-dst MAC	set souece mac in ARP header to MAC
+	-P, --packet	use AF_PACKET to write packets explicitly
+		--mac-dst MAC	set destnation mac to MAC
+		--mac-src MAC	set source mac to MAC
+		--mac-src--rand	randomize source mac
+#end-help-xping
+
+#help-synkill
+Usage: synkill [options] [-t] host [-p port] [-s host|-s-rand]
+	-t, --target	clear the next argument is target host,omissible
+	-p, --port	target port (default: 0)
+	-s, --source host	writer of packets (Mimicry,use the current host as default)
+	-s-rand, --source-rand	randomize the writer of packets,equivalence to --mac-src-rand --ip-src-rand
+	-i interface	which ethernet device/interface to use
+Synonym to: xping --src-port-rand -ET --tcp-flag s --ip-id-rand
+use --help for more options
+#end-help-synkill
+
